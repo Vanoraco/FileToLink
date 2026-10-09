@@ -11,6 +11,7 @@ StreamBot = Client(
     sleep_threshold=Var.SLEEP_THRESHOLD,
     workers=Var.WORKERS,
     max_concurrent_transmissions=1000,
+    workdir=Var.SESSION_DIR,
 )
 
 multi_clients = {}

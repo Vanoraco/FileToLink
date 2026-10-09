@@ -1,9 +1,12 @@
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1
+    PYTHONDONTWRITEBYTECODE=1 \
+    SESSION_DIR=/app/sessions
 
 WORKDIR /app
+
+RUN mkdir -p /app/sessions
 
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \

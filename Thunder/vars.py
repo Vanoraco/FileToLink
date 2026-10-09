@@ -36,6 +36,10 @@ class Var:
     NAME: str = os.getenv("NAME", "ThunderF2L")
     SLEEP_THRESHOLD: int = int(os.getenv("SLEEP_THRESHOLD", "600"))
     WORKERS: int = int(os.getenv("WORKERS", "8"))
+    # Directory for the Telegram session file. Point this at a mounted volume so
+    # a container recreate reuses the existing auth key instead of re-running
+    # ImportBotAuthorization (which Telegram floods after a few restarts).
+    SESSION_DIR: str = os.getenv("SESSION_DIR", ".")
 
     BIN_CHANNEL: int = int(os.getenv("BIN_CHANNEL", "0"))
 

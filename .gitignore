@@ -11,6 +11,7 @@ log.text
 *.session-journal
 *.session-shm
 *.session-wal
+thunder-sessions/
 build/
 develop-eggs/
 dist/
