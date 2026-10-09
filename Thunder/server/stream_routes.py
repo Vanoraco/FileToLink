@@ -1,5 +1,7 @@
 # Thunder/server/stream_routes.py
 
+import asyncio
+import os
 import re
 import secrets
 import time
@@ -20,6 +22,7 @@ from Thunder.utils.custom_dl import ByteStreamer
 from Thunder.utils.file_properties import get_media
 from Thunder.utils.logger import logger
 from Thunder.utils.render_template import render_media_page, render_page
+from Thunder.utils.stream_guard import pump_chunks
 from Thunder.utils.time_format import get_readable_time
 from Thunder.vars import Var
 
@@ -29,6 +32,9 @@ SECURE_HASH_LENGTH = 6
 CHUNK_SIZE = 1024 * 1024
 MAX_CONCURRENT_PER_CLIENT = 8
 OVERLOAD_RETRY_AFTER_SECONDS = 2
+# Abort a stream that makes no progress for this long so a stalled or half-open
+# client can never pin a client slot indefinitely.
+STREAM_IDLE_TIMEOUT = float(os.getenv("STREAM_IDLE_TIMEOUT_SECONDS", "120"))
 RANGE_REGEX = re.compile(r"^bytes=(?P<start>\d*)-(?P<end>\d*)$")
 PATTERN_HASH_FIRST = re.compile(
     rf"^([a-zA-Z0-9_-]{{{SECURE_HASH_LENGTH}}})(\d+)(?:/.*)?$")
@@ -184,83 +190,110 @@ async def _serve_media_response(
     fallback_message_id: int | None = None,
     on_fallback_message=None
 ):
-    file_size = int(file_info.get('file_size', 0) or 0)
-    if file_size == 0:
-        raise FileNotFound("File size is reported as zero or unavailable.")
+    # Own the slot for the whole lifetime of the response. The decrement lives
+    # in the outer ``finally`` so it runs on every exit path -- completion,
+    # error, client disconnect, cancellation or idle timeout.
+    work_loads[client_id] += 1
+    try:
+        file_size = int(file_info.get('file_size', 0) or 0)
+        if file_size == 0:
+            raise FileNotFound("File size is reported as zero or unavailable.")
 
-    range_header = request.headers.get("Range", "")
-    start, end = parse_range_header(range_header, file_size)
-    content_length = end - start + 1
+        range_header = request.headers.get("Range", "")
+        start, end = parse_range_header(range_header, file_size)
+        content_length = end - start + 1
 
-    if start == 0 and end == file_size - 1:
-        range_header = ""
+        if start == 0 and end == file_size - 1:
+            range_header = ""
 
-    mime_type = file_info.get('mime_type') or 'application/octet-stream'
-    filename = _resolve_filename(file_info, mime_type)
-    disposition = get_content_disposition(request)
+        mime_type = file_info.get('mime_type') or 'application/octet-stream'
+        filename = _resolve_filename(file_info, mime_type)
+        disposition = get_content_disposition(request)
 
-    headers = {
-        "Content-Type": mime_type,
-        "Content-Length": str(content_length),
-        "Content-Disposition": (
-            f"{disposition}; filename*=UTF-8''{quote(filename, safe='')}"),
-        "Accept-Ranges": "bytes",
-        "Cache-Control": "public, max-age=31536000",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Headers": "Range, Content-Type, *",
-        "Access-Control-Expose-Headers": (
-            "Content-Length, Content-Range, Content-Disposition"),
-        "X-Content-Type-Options": "nosniff"
-    }
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Length": str(content_length),
+            "Content-Disposition": (
+                f"{disposition}; filename*=UTF-8''{quote(filename, safe='')}"),
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=31536000",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Range, Content-Type, *",
+            "Access-Control-Expose-Headers": (
+                "Content-Length, Content-Range, Content-Disposition"),
+            "X-Content-Type-Options": "nosniff"
+        }
 
-    if range_header:
-        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        if range_header:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
-    if request.method == 'HEAD':
-        work_loads[client_id] -= 1
-        return web.Response(
+        if request.method == 'HEAD':
+            return web.Response(
+                status=206 if range_header else 200,
+                headers=headers
+            )
+
+        response = web.StreamResponse(
             status=206 if range_header else 200,
             headers=headers
         )
+        await response.prepare(request)
 
-    async def stream_generator():
+        bytes_sent = 0
+        bytes_to_skip = start % CHUNK_SIZE
+
+        async def write_chunk(chunk: bytes) -> bool:
+            nonlocal bytes_sent, bytes_to_skip
+            if bytes_to_skip > 0:
+                if len(chunk) <= bytes_to_skip:
+                    bytes_to_skip -= len(chunk)
+                    return True
+                chunk = chunk[bytes_to_skip:]
+                bytes_to_skip = 0
+
+            remaining = content_length - bytes_sent
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+
+            if chunk:
+                await response.write(chunk)
+                bytes_sent += len(chunk)
+
+            return bytes_sent < content_length
+
+        source = streamer.stream_file(
+            media_ref,
+            offset=start,
+            limit=content_length,
+            fallback_message_id=fallback_message_id,
+            on_fallback_message=on_fallback_message
+        )
         try:
-            bytes_sent = 0
-            bytes_to_skip = start % CHUNK_SIZE
-
-            async for chunk in streamer.stream_file(
-                media_ref,
-                offset=start,
-                limit=content_length,
-                fallback_message_id=fallback_message_id,
-                on_fallback_message=on_fallback_message
-            ):
-                if bytes_to_skip > 0:
-                    if len(chunk) <= bytes_to_skip:
-                        bytes_to_skip -= len(chunk)
-                        continue
-                    chunk = chunk[bytes_to_skip:]
-                    bytes_to_skip = 0
-
-                remaining = content_length - bytes_sent
-                if len(chunk) > remaining:
-                    chunk = chunk[:remaining]
-
-                if chunk:
-                    yield chunk
-                    bytes_sent += len(chunk)
-
-                if bytes_sent >= content_length:
-                    break
+            await pump_chunks(source, write_chunk, timeout=STREAM_IDLE_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Stream idle for {STREAM_IDLE_TIMEOUT}s "
+                f"(client {client_id}, media {media_ref}); dropping it."
+            )
+            response.force_close()
+            return response
+        except (ConnectionResetError, ConnectionError):
+            logger.debug(
+                f"Client left mid-stream (client {client_id}, media {media_ref})."
+            )
+            response.force_close()
+            return response
         finally:
-            work_loads[client_id] -= 1
+            try:
+                await source.aclose()
+            except Exception:
+                pass
 
-    return web.Response(
-        status=206 if range_header else 200,
-        body=stream_generator(),
-        headers=headers
-    )
+        await response.write_eof()
+        return response
+    finally:
+        work_loads[client_id] -= 1
 
 
 @routes.get("/", allow_head=True)
@@ -386,7 +419,6 @@ async def canonical_media_delivery(request: web.Request):
             raise FileNotFound("Canonical file not found")
 
         client_id, streamer = select_optimal_client()
-        work_loads[client_id] += 1
 
         try:
             _resolve_unique_id(file_record)
@@ -417,14 +449,11 @@ async def canonical_media_delivery(request: web.Request):
                 on_fallback_message=persist_refreshed_file_id
             )
         except (FileNotFound, InvalidHash):
-            work_loads[client_id] -= 1
             raise
         except web.HTTPException as e:
-            work_loads[client_id] -= 1
             logger.debug(f"Client HTTP error in canonical stream: {e}")
             raise
         except Exception as e:
-            work_loads[client_id] -= 1
             error_id = secrets.token_hex(6)
             logger.error(f"Canonical stream error {error_id}: {e}", exc_info=True)
             raise web.HTTPInternalServerError(
@@ -450,8 +479,6 @@ async def media_delivery(request: web.Request):
 
         client_id, streamer = select_optimal_client()
 
-        work_loads[client_id] += 1
-
         try:
             file_info = await streamer.get_file_info(message_id)
             unique_id = _resolve_unique_id(file_info)
@@ -468,14 +495,11 @@ async def media_delivery(request: web.Request):
             )
 
         except (FileNotFound, InvalidHash):
-            work_loads[client_id] -= 1
             raise
         except web.HTTPException as e:
-            work_loads[client_id] -= 1
             logger.debug(f"Client HTTP error in media stream: {e}")
             raise
         except Exception as e:
-            work_loads[client_id] -= 1
             error_id = secrets.token_hex(6)
             logger.error(
                 f"Stream error {error_id}: {e}",
