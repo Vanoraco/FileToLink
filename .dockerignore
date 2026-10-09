@@ -1,0 +1,7 @@
+# Never bake secrets, VCS state or runtime logs into the image.
+# Configuration is injected at runtime via the compose env_file (config.env).
+config.env
+.git
+__pycache__/
+*.pyc
+Thunder/logs/
